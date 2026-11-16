@@ -29,25 +29,39 @@ import json
 import logging
 import math
 import os
-import posixpath
 import re
 import subprocess
 import sys
 import threading
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from rd_library_ignore import LibraryIgnore
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = logging.getLogger("rex-stremio")
 MAX_FORM_BYTES = 1 << 20
 MAX_FORM_FIELDS = 2000
 MAX_JSON_BYTES = 16 << 20
+SEARCH_TIMEOUT = 10
+PROBE_TIMEOUT = 10
+OPEN_TIMEOUT = 10
+VERSION_PROBE_DELAY = 2
+PROBE_RETRY_SECONDS = 3
+REFUSALS = 3
+BACKOFF = 5
+MAX_BACKOFF = 60
+WARM_FETCH_SCRIPT = ("import sys,urllib.request\n"
+                     "url=sys.stdin.readline().rstrip('\\n')\n"
+                     "request=urllib.request.Request(url,headers={'User-Agent':'rex-stremio','Accept':'application/json'})\n"
+                     "with urllib.request.urlopen(request,timeout=30) as response: sys.stdout.buffer.write(response.read())\n")
 
 DEFAULTS = {
     "rex_url": "http://127.0.0.1:32400",
+    "rex_token": None,
     "source": "stremio",
     "listen": "127.0.0.1:9982",
     "relay_url": None,
@@ -59,10 +73,11 @@ DEFAULTS = {
     "retry_minutes": 10,
     "max_resolution": None,
     "collections": False,
+    "ondemand_movies_library": "On Demand Movies",
+    "ondemand_tv_library": "On Demand TV",
+    "hide_ondemand_libraries": True,
+    "exclude_rd_library": False,
     "max_size_gb": None,
-    "probe_workers": 4,
-    "dmm_api_key": None,
-    "share_probes": True,
     "addons": [],
     "catalogs": [],
 }
@@ -89,42 +104,11 @@ LIBRARIES = {"movie": "Stremio Films", "series": "Stremio Shows", "tv": "Live TV
 REX_KINDS = {"movie": "movies", "series": "shows", "tv": "movies"}
 
 
-# The ffprobe output DMM holds per torrent, file by file (path, bytes, MediaInfo), for its sponsors'
-# keys: at most 100 hashes an ask and 25 asks a minute from one address. Of Torrentio's 246 releases
-# of The Matrix it held 83, and 9 of the 10 it ranks first (2026-11-06).
-DMM_MEDIAINFO = "https://debridmediamanager.com/api/sponsor/mediainfo"
-# What rex-stremio probes of a torrent's file itself goes back to DMM, so the next sponsor skips it:
-# up to SHARE_BATCH probes (and SHARE_BYTES) a request, spaced as lookups are.
-DMM_PROBES = "https://debridmediamanager.com/api/sponsor/probes"
-SHARE_BATCH = 50
-SHARE_BYTES = 6 << 20
-DMM_BATCH = 100
-DMM_SPACING = 60 / 25
-DMM_GATHER = 0.5  # how long the first ask waits for other workers' hashes to join it
-
-# Items reach rex as they are ready: in batches of READY_BATCH, or whatever is ready every
-# READY_SECONDS, whichever comes first.
-READY_BATCH = 20
-READY_SECONDS = 5
-
-# How long a probe a host answered with a 5xx waits before it is run once more.
-PROBE_RETRY_SECONDS = 3
-
-# A stream addon's host is asked at most once per `stream_interval_seconds`. One that refuses (429,
-# or `{"streams": null}`) is asked again after its Retry-After, else BACKOFF doubling, at most
-# MAX_BACKOFF; after REFUSALS in a row, not before `retry_minutes`. 111477's Cloudflare limit
-# allowed 3 requests in 10 s and refused the 4th with Retry-After 10 (2026-11-04).
-REFUSALS = 3
-BACKOFF = 5
-MAX_BACKOFF = 60
-
-
 class Refused(Exception):
     pass
 
 
 def retry_after(value):
-    """Retry-After's seconds (a number or an HTTP date), or None."""
     try:
         return max(float(value), 0.0)
     except (TypeError, ValueError):
@@ -374,13 +358,13 @@ def request_headers(stream):
             if isinstance(value, (str, int)) and str(name).lower() not in ("accept-encoding", "range", "host", "connection", "content-length")}
 
 
-def opens(url, headers=None):
+def opens(url, headers=None, timeout=OPEN_TIMEOUT):
     """The link a stream ends at, when it opens; None when it does not (an expired or refused link,
     or a web page: addons list their configure page, a donation or status page as a "stream", and
     Comet's unconfigured answer was nothing else, 2026-10-24)."""
     request = urllib.request.Request(url, headers=dict({"User-Agent": "rex-stremio"}, **(headers or {}), Range="bytes=0-0"))
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             kind = response.headers.get_content_type()
             if kind == "text/html":
                 LOG.info("%s: a web page, not a video", safe_url(url))
@@ -401,179 +385,6 @@ def opens(url, headers=None):
     except Exception as error:
         LOG.info("%s: %s", safe_url(url), safe_error(error))
         return None
-
-
-def info_hash(stream):
-    """A torrent stream's info hash: its `infoHash`, else the one its link's path carries
-    (Torrentio's debrid links are `/resolve/<provider>/<key>/<hash>/<file>/<name>`, 2026-11-06)."""
-    if not isinstance(stream, dict):
-        return None
-    named = stream.get("infoHash")
-    if isinstance(named, str) and re.fullmatch(r"[0-9a-fA-F]{40}", named):
-        return named.lower()
-    path = urllib.parse.urlsplit(stream["url"]).path if isinstance(stream.get("url"), str) else ""
-    found = re.search(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])", path)
-    return found[0].lower() if found else None
-
-
-def served_size(url, headers=None):
-    """The size of the file a link serves, as its answer to a one-byte Range names it."""
-    request = urllib.request.Request(url, headers=dict({"User-Agent": "rex-stremio"}, **(headers or {}), Range="bytes=0-0"))
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            total = re.search(r"/(\d+)$", response.headers.get("Content-Range") or "")
-            return int(total[1]) if total else None
-    except Exception as error:
-        LOG.info("%s: %s", safe_url(url), safe_error(error))
-        return None
-
-
-def stored_probe(release, size, filename=None):
-    """DMM's probe of the file of exactly `size` bytes in a release (and of that name, when the
-    stream names its file); None unless exactly one file fits. A pack's episodes differ in size,
-    and a size alone can be shared (a DVD's VOBs), so two files that fit are no answer."""
-    files = (release or {}).get("files") if isinstance(release, dict) else None
-    if not size or not isinstance(files, dict):
-        return None
-    fits = [entry for entry in files.values() if isinstance(entry, dict) and entry.get("bytes") == size
-            and isinstance(entry.get("MediaInfo"), dict) and isinstance(entry["MediaInfo"].get("format"), dict)
-            and (not filename or posixpath.basename(str(entry.get("path") or "")) == filename)]
-    if len(fits) != 1:
-        return None
-    probe = copy.deepcopy(fits[0]["MediaInfo"])
-    probe["format"].setdefault("size", str(size))
-    return probe
-
-
-class StoredProbes:
-    """DMM's stored probes for one sponsor key. Workers ask for one hash each; the first to ask
-    waits DMM_GATHER for the others, then sends up to DMM_BATCH hashes in one request, spaced
-    DMM_SPACING apart. A hash DMM does not hold, or any failure, answers None: that item is
-    probed. A refused key (401) is not used again until the key changes."""
-
-    def __init__(self, key, url=None, probes_url=None):
-        self.key, self.url, self.probes_url = key, url or DMM_MEDIAINFO, probes_url or DMM_PROBES
-        self.condition = threading.Condition()
-        self.known, self.pending, self.inflight = {}, [], set()
-        self.asking, self.refused, self.next_ask = False, False, 0.0
-        # Probes to share (`share`), sent by `flush`.
-        self.outbox, self.outbox_lock, self.next_share = [], threading.Lock(), 0.0
-
-    def share(self, probe):
-        """Queue a probe of a torrent's file for DMM: {"hash", "bytes", "name"?, "MediaInfo"}."""
-        with self.outbox_lock:
-            if not self.refused:
-                self.outbox.append(probe)
-
-    def flush(self, final=False):
-        """Send what is queued in batches of SHARE_BATCH, or all of it when `final`. A batch DMM refuses
-        is dropped: those files are probed again by whoever meets them next. Answers how many went."""
-        sent = 0
-        while True:
-            with self.outbox_lock:
-                if self.refused or not self.outbox or (len(self.outbox) < SHARE_BATCH and not final):
-                    return sent
-                batch, size = [], 0
-                while self.outbox and len(batch) < SHARE_BATCH:
-                    one = len(json.dumps(self.outbox[0]))
-                    if batch and size + one > SHARE_BYTES:
-                        break
-                    batch.append(self.outbox.pop(0))
-                    size += one
-                wait = self.next_share - time.time()
-            if wait > 0:
-                time.sleep(wait)
-            request = urllib.request.Request(self.probes_url, data=json.dumps({"probes": batch}).encode(), method="POST",
-                                             headers={"Content-Type": "application/json", "Accept": "application/json",
-                                                      "User-Agent": "rex-stremio", "x-api-key": self.key})
-            try:
-                with urllib.request.urlopen(request, timeout=60) as response:
-                    answer = response_json(response)
-                sent += len(batch)
-                LOG.info("shared %d probes with DMM: %s new", len(batch), answer.get("saved") if isinstance(answer, dict) else "?")
-                for rejected in (answer.get("rejected") or []) if isinstance(answer, dict) else []:
-                    LOG.info("DMM refused a probe: %s", safe_error(rejected.get("error") if isinstance(rejected, dict) else rejected))
-            except urllib.error.HTTPError as error:
-                if error.code == 401:
-                    with self.condition:
-                        self.refused = True
-                    LOG.warning("DMM refused dmm_api_key (sponsors only): probing every item")
-                else:
-                    LOG.info("sharing probes with DMM: %s", safe_error(error))
-            except Exception as error:
-                LOG.info("sharing probes with DMM: %s", safe_error(error))
-            self.next_share = time.time() + DMM_SPACING
-
-    def release(self, hash_, timeout=120):
-        deadline = time.time() + timeout
-        with self.condition:
-            while True:
-                if self.refused:
-                    return None
-                if hash_ in self.known:
-                    return self.known[hash_]
-                if hash_ not in self.pending and hash_ not in self.inflight:
-                    self.pending.append(hash_)
-                if not self.asking:  # nobody is asking: this worker asks for everyone waiting
-                    self.asking = True
-                    break
-                left = deadline - time.time()
-                if left <= 0:
-                    return None
-                self.condition.wait(left)
-        self.ask_all()
-        with self.condition:
-            return self.known.get(hash_)
-
-    def ask_all(self):
-        """Ask until nothing is pending. The last look at `pending` and giving up the asking are
-        one step under the lock, so a hash added meanwhile finds nobody asking and asks itself."""
-        try:
-            time.sleep(DMM_GATHER)
-            while True:
-                with self.condition:
-                    batch, self.pending = self.pending[:DMM_BATCH], self.pending[DMM_BATCH:]
-                    if not batch or self.refused:
-                        self.asking = False
-                        self.condition.notify_all()
-                        return
-                    self.inflight.update(batch)
-                    wait = self.next_ask - time.time()
-                if wait > 0:
-                    time.sleep(wait)
-                releases = self.ask(batch)
-                with self.condition:
-                    self.next_ask = time.time() + DMM_SPACING
-                    for hash_ in batch:
-                        self.known[hash_] = releases.get(hash_)
-                    self.inflight.difference_update(batch)
-                    self.condition.notify_all()
-        except BaseException:
-            with self.condition:
-                self.asking = False
-                self.inflight.clear()
-                self.condition.notify_all()
-            raise
-
-    def ask(self, batch):
-        request = urllib.request.Request(self.url, data=json.dumps({"hashes": batch}).encode(), method="POST",
-                                         headers={"Content-Type": "application/json", "Accept": "application/json",
-                                                  "User-Agent": "rex-stremio", "x-api-key": self.key})
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                answer = response_json(response)
-            releases = answer.get("releases") if isinstance(answer, dict) else None
-            return releases if isinstance(releases, dict) else {}
-        except urllib.error.HTTPError as error:
-            if error.code == 401:
-                with self.condition:
-                    self.refused = True
-                LOG.warning("DMM refused dmm_api_key (sponsors only): probing every item")
-            else:
-                LOG.info("DMM stored probes: %s", safe_error(error))
-        except Exception as error:
-            LOG.info("DMM stored probes: %s", safe_error(error))
-        return {}
 
 
 def load_config(path):
@@ -604,6 +415,8 @@ def load_config(path):
             raise ValueError("%s must be an http(s) URL" % key)
     if not isinstance(config.get("cache"), str) or not config["cache"]:
         raise ValueError("cache must be a path")
+    if config.get("rex_token") is not None and (not isinstance(config["rex_token"], str) or not config["rex_token"]):
+        raise ValueError("rex_token must be a non-empty string")
     for key in ("listen", "mount", "ffprobe"):
         if not isinstance(config.get(key), str) or not config[key]:
             raise ValueError("%s must be a string" % key)
@@ -618,13 +431,6 @@ def load_config(path):
     if interval <= 0:
         raise ValueError("interval_minutes must be positive")
     config["interval_minutes"] = interval
-    try:
-        config["stream_interval_seconds"] = float(config.get("stream_interval_seconds"))
-        config["retry_minutes"] = float(config.get("retry_minutes"))
-    except (TypeError, ValueError):
-        raise ValueError("stream_interval_seconds and retry_minutes must be numbers")
-    if not (0 <= config["stream_interval_seconds"] <= 60) or not (0 < config["retry_minutes"] <= 1440):
-        raise ValueError("stream_interval_seconds must be 0 to 60, retry_minutes above 0 and at most 1440")
     if config.get("max_resolution") is not None:
         try:
             config["max_resolution"] = int(config["max_resolution"])
@@ -641,18 +447,12 @@ def load_config(path):
             raise ValueError("max_size_gb must be positive")
     if not isinstance(config.get("collections"), bool):
         raise ValueError("collections must be true or false")
-    try:
-        config["probe_workers"] = int(config.get("probe_workers"))
-    except (TypeError, ValueError):
-        raise ValueError("probe_workers must be 1 to 16")
-    if not 1 <= config["probe_workers"] <= 16:
-        raise ValueError("probe_workers must be 1 to 16")
-    if config.get("dmm_api_key") is not None:
-        if not isinstance(config["dmm_api_key"], str):
-            raise ValueError("dmm_api_key must be a key or null")
-        config["dmm_api_key"] = config["dmm_api_key"].strip() or None
-    if not isinstance(config.get("share_probes"), bool):
-        raise ValueError("share_probes must be true or false")
+    for key in ("ondemand_movies_library", "ondemand_tv_library"):
+        if not isinstance(config.get(key), str) or not config[key].strip():
+            raise ValueError("%s must be a library name" % key)
+        config[key] = config[key].strip()[:160]
+    if not isinstance(config.get("hide_ondemand_libraries"), bool):
+        raise ValueError("hide_ondemand_libraries must be true or false")
     if config["cache"] and not os.path.isabs(config["cache"]):
         config["cache"] = os.path.join(os.path.dirname(os.path.abspath(path)), config["cache"])
     if not config["relay_url"]:
@@ -754,7 +554,7 @@ def lenient_hls(ffprobe):
     whose segments' format does not match its URL's extension, as PenguPlay's channels' WebVTT
     rendition does (ffprobe 8.1, 2026-10-24); an older one refuses the unknown option."""
     try:
-        out = subprocess.run([ffprobe, "-hide_banner", "-h", "demuxer=hls"], capture_output=True, timeout=30).stdout
+        out = subprocess.run([ffprobe, "-hide_banner", "-h", "demuxer=hls"], capture_output=True, timeout=2).stdout
     except (OSError, subprocess.SubprocessError):
         return ()
     return ("-extension_picky", "0") if b"-extension_picky" in out else ()
@@ -775,6 +575,22 @@ def expiry(url):
     return int(match[1]) if match else time.time() + 7200
 
 
+def provisional_probe(meta, video=None):
+    """Explicitly provisional bootstrap data, replaced by measured data on open.
+
+    Catalogs contain no codec facts. These deliberately configured assumptions
+    keep Rex's probe-gated rows visible; they are not a claim of verification.
+    """
+    value = {"format": {"format_name": "matroska,webm", "tags": {"comment": "provisional; awaiting playback probe"}},
+             "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080, "pix_fmt": "yuv420p"},
+                         {"index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2, "sample_rate": "48000"}]}
+    runtime = str((video or {}).get("runtime") or meta.get("runtime") or "")
+    minutes = re.fullmatch(r"(\d+(?:\.\d+)?)(?: min)?", runtime.strip())
+    if minutes:
+        value["format"]["duration"] = str(float(minutes[1]) * 60)
+    return value
+
+
 def stremio_item(config, catalog, vid, imdb, meta, video, probe, extension):
     """One feed item (`docs/feed-api.md`): placed by its IMDb id, dressed by the catalog. A live
     channel has no IMDb id (`imdb` is the addon's own id): it goes unplaced, named by `display`."""
@@ -792,6 +608,7 @@ def stremio_item(config, catalog, vid, imdb, meta, video, probe, extension):
         "file": "%s/%s" % (config["mount"].rstrip("/"), file),
         "name": meta.get("name") or imdb or str(meta.get("id")),
         "release": "stremio:%s" % (imdb or meta.get("id")),
+        "version_group": "stremio:" + hashlib.sha256(vid.encode()).hexdigest(),
         "media_info": probe,
     }
     if catalog["type"] != "tv" and imdb:
@@ -829,13 +646,127 @@ def prune(value):
     return value
 
 
+class StreamSearch:
+    """A bounded search whose later results can arrive while a candidate is probed."""
+    def __init__(self, addons, ask, control=None):
+        self.condition = threading.Condition()
+        self.control = control
+        self.deadline = time.monotonic() + SEARCH_TIMEOUT
+        self.answers = {}
+        self.pending = len(addons)
+        for index, pair in enumerate(addons):
+            threading.Thread(target=self.fetch, args=(index, pair, ask),
+                             name="stream-search", daemon=True).start()
+
+    def fetch(self, index, pair, ask):
+        try:
+            answer = ask(pair)
+        except Exception:
+            answer = []
+        with self.condition:
+            if time.monotonic() <= self.deadline and not (self.control and self.control.cancelled.is_set()):
+                self.answers[index] = answer
+            self.pending -= 1
+            self.condition.notify_all()
+
+
+    def __len__(self):
+        with self.condition:
+            return sum(len(answer) for answer in self.answers.values())
+
+    def candidates(self, config, pinned, refused, deadline=None):
+        deadline = self.deadline if deadline is None else min(deadline, self.deadline)
+        seen = set(refused)
+        while True:
+            with self.condition:
+                streams = [stream for index in sorted(self.answers)
+                           for stream in self.answers[index]]
+                choices = [stream for stream in ranked(streams, config, pinned)
+                           if stream_key(stream) not in seen]
+                if not choices:
+                    remaining = deadline - time.monotonic()
+                    if not self.pending or remaining <= 0:
+                        return
+                    self.condition.wait(remaining)
+                    continue
+            for stream in choices:
+                key = stream_key(stream)
+                if key not in seen:
+                    seen.add(key)
+                    yield stream
+
+
+class WarmControl:
+    """One detail-page search, with provider processes that can be stopped on navigation."""
+    def __init__(self):
+        self.cancelled = threading.Event()
+        self.guard = threading.Lock()
+        self.processes = set()
+        self.playback = False
+
+    def promote(self):
+        with self.guard:
+            self.playback = True
+
+    def cancel(self):
+        self.cancelled.set()
+        with self.guard:
+            for process in tuple(self.processes):
+                if process.poll() is None:
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+
+    def get_json(self, url):
+        if self.cancelled.is_set():
+            return {}
+        process = subprocess.Popen([sys.executable, "-c", WARM_FETCH_SCRIPT], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        with self.guard:
+            self.processes.add(process)
+            if self.cancelled.is_set():
+                if process.poll() is None:
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+        try:
+            try:
+                output, _ = process.communicate(input=(url + "\n").encode(), timeout=31)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                return {}
+            if process.returncode or len(output) > MAX_JSON_BYTES or self.cancelled.is_set():
+                return {}
+            return json.loads(output)
+        finally:
+            with self.guard:
+                self.processes.discard(process)
+
+
 class Sync:
     def __init__(self, config):
         self.config = config
         self.wake = threading.Event()
+        self.hosts, self.hosts_lock = {}, threading.Lock()
+        self.retry_soon = False
         self.status = "not synced yet"
         self.cache, self.locks, self.guard = {}, {}, threading.Lock()
         self.cache_locks = {}
+        self.prepared = {}
+        self.stream_searches = collections.OrderedDict()
+        self.playback_searches = collections.OrderedDict()
+        self.warm_item = None
+        self.warm_control = None
+        self.prefetch_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="next-episode")
+        self.version_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stream-versions")
+        self.rd_library_ignore = LibraryIgnore() if config.get("exclude_rd_library") else None
+        self.playback_publication_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="playback-feed")
+        self.prefetching = set()
+        self.versioning = set()
+        self.playback_started = {}
         # The headers each item's link is asked with, and the links its playlists name, which the
         # relay fetches with them (`relayed`): no other URL is fetched for anyone.
         self.via, self.relayed = {}, {}
@@ -843,6 +774,11 @@ class Sync:
         # Feed publication and settings commits share this lock. Readers never take it, so a
         # stalled rex request cannot stop the relay or settings page from serving.
         self.publication_lock = threading.RLock()
+        self.snapshot_playbacks = None
+        self.poster_lock = threading.Lock()
+        self.poster_schedule_lock = threading.Lock()
+        self.poster_pending = None
+        self.poster_running = False
         self.config_version = 0
         # Set by a save on the settings page: the next complete snapshot may remove more than half
         # of what rex holds (catalogs unticked, catalogs turned into collections), which rex
@@ -852,12 +788,6 @@ class Sync:
         # A sync's titles held by a catalog, `(directory, type, imdb)`, and the IMDb ids the last
         # catalog listed: with `collections` on, one title per library (`catalog_items`).
         self.taken, self.catalog_listed = set(), set()
-        # Each stream addon host's pacing: when it may be asked next and its refusals in a row.
-        # `retry_soon`: a host refused during this pass, so the next one comes after retry_minutes.
-        self.hosts, self.hosts_lock, self.retry_soon = {}, threading.Lock(), False
-        # The stream each item last resolved to (`_resolve`), for its torrent's hash, and DMM's
-        # stored probes for the configured key (`stored`).
-        self.picked, self.dmm = {}, None
 
     def path(self, kind, vid, config=None, version=None):
         config = self.config if config is None else config
@@ -969,7 +899,7 @@ class Sync:
                 bases.append(TMDB_META)
             for base in bases:
                 try:
-                    found = get_json("%s/meta/%s/%s.json" % (base, kind, urllib.parse.quote(sid)), 30).get("meta") or {}
+                    found = get_json("%s/meta/%s/%s.json" % (base, kind, urllib.parse.quote(sid)), SEARCH_TIMEOUT).get("meta") or {}
                 except Exception as error:
                     LOG.info("%s: %s: %s", sid, safe_url(base), safe_error(error))
                     continue
@@ -1048,13 +978,20 @@ class Sync:
             with self.config_guard:
                 if self.config_version != version:
                     return None
-            return self.rex(method, path, body, config)
+            if isinstance(body, dict) and "items" in body:
+                body = dict(body, items=self.lazy_chunk(body["items"], config, version))
+            answer = self.rex(method, path, body, config)
+        self.schedule_collection_posters(config)
+        return answer
 
     def rex(self, method, path, body=None, config=None):
         config = self.config if config is None else config
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if config.get("rex_token"):
+            headers["X-Plex-Token"] = config["rex_token"]
         request = urllib.request.Request(rex_endpoint(config["rex_url"], path), method=method,
                                          data=None if body is None else json.dumps(body).encode(),
-                                         headers={"Content-Type": "application/json", "Accept": "application/json"})
+                                         headers=headers)
         with urllib.request.urlopen(request, timeout=600) as response:
             answer = response_json(response)
         if not isinstance(answer, dict):
@@ -1067,14 +1004,52 @@ class Sync:
         for catalog in config["catalogs"]:
             kind = REX_KINDS[catalog["type"]]
             directories.setdefault(catalog["directory"], {"name": catalog["directory"]}).setdefault(kind, catalog["library"])
+        directories.setdefault("ondemand-movies", {"name": "ondemand-movies"})["movies"] = config["ondemand_movies_library"]
+        directories.setdefault("ondemand-tv", {"name": "ondemand-tv"})["shows"] = config["ondemand_tv_library"]
         answer = self.rex("PUT", "/rex/sources/" + config["source"],
-                          {"url": config["relay_url"], "mount": config["mount"], "directories": list(directories.values())}, config)
+                          {"url": config["relay_url"], "mount": config["mount"], "directories": list(directories.values()),
+                           "detail_search": True}, config)
         for ignored in answer.get("ignored") or []:
             if not isinstance(ignored, dict):
                 continue
             LOG.warning("rex ignored %s: %s", safe_error(ignored.get("entry")), safe_error(ignored.get("reason")))
+        self.set_ondemand_library_visibility(config)
 
-    def streams(self, kind, sid, config=None, also=()):
+    def set_ondemand_library_visibility(self, config=None):
+        """Apply the configured Rex visibility to the dedicated virtual-card sections."""
+        config = self.config if config is None else config
+        answer = self.rex("GET", "/library/sections", config=config)
+        rows = ((answer.get("MediaContainer") or {}).get("Directory") or [])
+        if isinstance(rows, dict):
+            rows = [rows]
+        wanted = {
+            ("movie", "ondemand-movies"): config["ondemand_movies_library"],
+            ("show", "ondemand-tv"): config["ondemand_tv_library"],
+        }
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            kind = "show" if row.get("type") in ("show", "2") else "movie"
+            key = row.get("key")
+            locations = row.get("Location") or []
+            if isinstance(locations, dict):
+                locations = [locations]
+            directories = [str(location.get("path", "")).rstrip("/").rsplit("/", 1)[-1]
+                           for location in locations if isinstance(location, dict)]
+            directory = next((name for name in wanted if name[0] == kind and name[1] in directories), None)
+            if directory is None or not isinstance(key, (str, int)):
+                continue
+            section = str(key).rstrip("/").rsplit("/", 1)[-1]
+            if section.isdigit():
+                title = wanted[directory]
+                if row.get("title") != title:
+                    agent = "tv.plex.agents.series" if kind == "show" else "tv.plex.agents.movie"
+                    query = urllib.parse.urlencode({"agent": agent, "type": kind, "name": title})
+                    self.rex("PUT", "/library/sections/%s?%s" % (section, query), config=config)
+                hidden = "2" if config["hide_ondemand_libraries"] else "0"
+                self.rex("PUT", "/library/sections/%s/prefs?hidden=%s" % (section, hidden), config=config)
+
+    def streams(self, kind, sid, config=None, also=(), warm_control=None):
         """Every stream the addons that serve this item give, in the addons' order. Each addon is
         asked by the id it serves: its catalog's own id (`also`) first, as Stremio asks by the id
         a catalog gave, else the item's IMDb id."""
@@ -1090,12 +1065,35 @@ class Sync:
             addon, sid = pair
             manifest = addon_manifest(addon)
             try:
-                answer = self.ask_addon("%s/stream/%s/%s.json" % (addon_base(addon["url"]), kind, urllib.parse.quote(sid)), config)
+                target = "%s/stream/%s/%s.json" % (addon_base(addon["url"]), kind, urllib.parse.quote(sid))
+                answer = warm_control.get_json(target) if warm_control else self.ask_addon(target, config)
                 streams = answer.get("streams") if isinstance(answer, dict) else []
+                LOG.debug("SEARCH addon=%s episode=%s candidates=%d", manifest.get("name") or "addon", sid, len(streams) if isinstance(streams, list) else 0)
                 return [stream for stream in streams or [] if isinstance(stream, dict)] if isinstance(streams, list) else []
             except Exception as error:
                 LOG.warning("%s: %s: %s", sid, manifest.get("name") or "addon", safe_error(error))
                 return []
+        if config.get("lazy_catalogs"):
+            key = (self.config_version, kind, sid, tuple(also))
+            with self.guard:
+                search = self.stream_searches.get(key)
+                expired_warm = (search is not None and warm_control is None and search.control
+                                and time.monotonic() >= search.deadline and not len(search))
+                if search is None or time.monotonic() > search.deadline + PROBE_TIMEOUT or (search.control and search.control.cancelled.is_set()) or expired_warm:
+                    if expired_warm:
+                        search.control.cancel()
+                    search = StreamSearch(addons, ask, warm_control)
+                    self.stream_searches[key] = search
+                    self.stream_searches.move_to_end(key)
+                    while len(self.stream_searches) > 128:
+                        self.stream_searches.popitem(last=False)
+                elif warm_control is None and search.control and search.pending:
+                    # Playback joining a detail search gets its own full search window.
+                    # The provider request stays in flight; no second request is queued.
+                    search.control.promote()
+                    with search.condition:
+                        search.deadline = max(search.deadline, time.monotonic() + SEARCH_TIMEOUT)
+                return search
         with ThreadPoolExecutor(max(len(addons), 1)) as pool:
             return [stream for answer in pool.map(ask, addons) for stream in answer]
 
@@ -1121,6 +1119,7 @@ class Sync:
                 if state.get("refused", 0) != booked:
                     continue
             try:
+                asked_at = time.time()
                 answer = get_json(url, 30)
                 if isinstance(answer, dict) and "streams" in answer and not isinstance(answer["streams"], list):
                     raise Refused("streams is not an array")  # 111477's while its own index is throttled
@@ -1144,7 +1143,38 @@ class Sync:
                 continue
             with self.hosts_lock:
                 state["refusals"] = 0
+            if self.rd_library_ignore and isinstance(answer, dict) and isinstance(answer.get("streams"), list):
+                self.rd_library_ignore.note(answer["streams"], asked_at)
             return answer
+
+    def warm_search(self, vid):
+        # An on-demand episode may be catalogued by Rex before its virtual file
+        # has ever been opened. Register its lightweight info now so the season
+        # listing can start the provider search ahead of Play.
+        with self.config_guard:
+            catalogs = copy.deepcopy(self.config["catalogs"])
+        owner = max((catalog for catalog in catalogs if vid.startswith(catalog["slug"] + "-")),
+                    key=lambda catalog: len(catalog["slug"]), default=None)
+        if owner:
+            self.route_vid("/%s/%s/%s.mkv" % (owner["directory"], owner["slug"], vid))
+        with self.config_guard:
+            config = copy.deepcopy(self.config)
+        try:
+            with open(self.path("info", vid)) as handle:
+                info = json.load(handle)
+        except (OSError, ValueError):
+            return
+        if not info.get("kind") or not info.get("sid") or info.get("variant_stream"):
+            return
+        with self.guard:
+            if self.warm_item == vid:
+                return
+            if self.warm_control and not self.warm_control.playback:
+                self.warm_control.cancel()
+            control = WarmControl()
+            self.warm_item, self.warm_control = vid, control
+        self.streams(info["kind"], info["sid"], config, info.get("also") or (), control)
+        LOG.info("SEARCH warm item=%s", vid)
 
     def resolve(self, vid):
         with self.config_guard:
@@ -1156,6 +1186,7 @@ class Sync:
         with self.guard:
             lock = self.locks.setdefault(vid, threading.Lock())
         with lock:  # one ask per item; other items resolve meanwhile
+            started = time.monotonic()
             with self.guard:
                 url, good_until = self.cache.get(vid, (None, 0))
             if time.time() < good_until:
@@ -1169,12 +1200,34 @@ class Sync:
                     self.cache.pop(vid, None)
             with open(self.path("info", vid, config, version)) as handle:
                 info = json.load(handle)
+            wanted_stream = info.get("variant_stream")
             refused = {entry.get("key") for entry in info.get("refused") or []
                        if isinstance(entry, dict) and time.time() - entry.get("at", 0) < 86400}
-            for stream in ranked(self.streams(info["kind"], info["sid"], config, info.get("also") or ()), config, info.get("stream")):
+            if config.get("lazy_catalogs") and time.monotonic() - started >= SEARCH_TIMEOUT:
+                raise RuntimeError("stream lookup timed out after %ss" % SEARCH_TIMEOUT)
+            streams = self.streams(info["kind"], info["sid"], config, info.get("also") or ())
+            if not wanted_stream:
+                with self.guard:
+                    self.playback_searches[vid] = streams
+                    self.playback_searches.move_to_end(vid)
+                    while len(self.playback_searches) > 128:
+                        self.playback_searches.popitem(last=False)
+            LOG.info("TIMING providers item=%s duration_s=%.3f initial_candidates=%d (providers may still be searching)", vid, time.monotonic()-started, len(streams))
+            candidates = streams.candidates(config, info.get("stream"), refused, started + SEARCH_TIMEOUT) if isinstance(streams, StreamSearch) else ranked(streams, config, info.get("stream"))
+            for stream in candidates:
+                if wanted_stream and stream_key(stream) != wanted_stream:
+                    continue
                 if stream_key(stream) in refused:
                     continue
-                url = opens(stream["url"], request_headers(stream))
+                opened = time.monotonic()
+                if config.get("lazy_catalogs"):
+                    remaining = SEARCH_TIMEOUT - (opened - started)
+                    if remaining <= 0:
+                        raise RuntimeError("stream search timed out after %ss" % SEARCH_TIMEOUT)
+                    url = opens(stream["url"], request_headers(stream), timeout=remaining)
+                else:
+                    url = opens(stream["url"], request_headers(stream))
+                LOG.info("TIMING open item=%s duration_s=%.3f result=%s", vid, time.monotonic()-opened, "ok" if url else "unavailable")
                 if not url:
                     continue
                 if not info.get("stream"):  # the first one that opens is what the probe describes
@@ -1189,8 +1242,6 @@ class Sync:
                     self.wake.set()
                 self.store_cache(version, vid, (url, max(time.time(), min(expiry(stream["url"]), expiry(url)) - 3600)),
                                  request_headers(stream))
-                with self.guard:
-                    self.picked[vid] = stream
                 return url
             raise RuntimeError("no stream addon has a stream that opens")
 
@@ -1213,8 +1264,33 @@ class Sync:
             return None
         info_path = os.path.join(cache, "info", vid + ".json")
         if not os.path.isfile(info_path):
-            return None
-        if extension == "stream":
+            # Rex recommendation cards name a movie by IMDb id. Register the
+            # virtual file on first access; playback still searches addons and
+            # probes a real stream in prepare().
+            match_id = re.fullmatch(re.escape(catalog_slug) + r"-(tt\d+)-ondemand", vid)
+            episode_id = re.fullmatch(re.escape(catalog_slug) + r"-(tt\d+)-s(\d+)e(\d+)-ondemand", vid)
+            if extension != "mkv" or not ((match_id and catalog["type"] == "movie")
+                                          or (episode_id and catalog["type"] == "series")):
+                return None
+            imdb = (match_id or episode_id)[1]
+            item_path = "%s/%s/%s.mkv" % (directory, catalog_slug, vid)
+            item = {"id": "st-" + vid, "path": item_path,
+                    "file": self.config["mount"].rstrip("/") + "/" + item_path,
+                    "name": imdb, "release": "stremio:" + imdb,
+                    "version_group": "stremio:" + hashlib.sha256(vid.encode()).hexdigest(),
+                    "media_info": provisional_probe({"name": imdb}),
+                    "ids": {"imdb": imdb}, "kind": "movie" if match_id else "episode",
+                    "display": {"title": imdb}}
+            if episode_id:
+                item["season"], item["episode"] = int(episode_id[2]), int(episode_id[3])
+                sid = "%s:%s:%s" % (imdb, episode_id[2], episode_id[3])
+            else:
+                sid = imdb
+            self.cached("info", vid, lambda: {
+                "kind": catalog["type"], "sid": sid, "also": [],
+                "catalog": catalog, "item": item, "next": None,
+                "extension": "mkv"})
+        if extension in ("stream", "probe"):
             return vid
         try:
             with open(info_path) as handle:
@@ -1231,75 +1307,310 @@ class Sync:
         except (AttributeError, OSError, ValueError, TypeError):
             return None
 
-    def dmm_for(self, key):
-        """The DMM client for this sponsor key, made when the key is first used or changes."""
-        with self.guard:
-            if self.dmm is None or self.dmm.key != key:
-                self.dmm = StoredProbes(key)
-            return self.dmm
-
-    def share(self, vid, probe, config):
-        """Queue the probe ffprobe took of a torrent's file for DMM (`dmm_api_key` set), so the next sponsor to
-        meet that file skips it. Only a file's probe that names its size: a playlist's size is the playlist's. The probe is
-        answered as it is either way; sharing never fails it."""
-        key = config.get("dmm_api_key")
-        try:
-            with self.guard:
-                stream = self.picked.get(vid)
-            hash_ = info_hash(stream)
-            size = str((probe.get("format") or {}).get("size") or "")
-            if key and config.get("share_probes", True) and hash_ and size.isdigit() and int(size) > 0 and probe["format"].get("format_name") != "hls":
-                hints = stream.get("behaviorHints") if isinstance(stream.get("behaviorHints"), dict) else {}
-                shared = {"hash": hash_, "bytes": int(size), "MediaInfo": dict(probe, format={k: v for k, v in probe["format"].items() if k != "filename"})}
-                if isinstance(hints.get("filename"), str) and hints["filename"]:
-                    shared["name"] = hints["filename"]
-                self.dmm_for(key).share(shared)
-        except Exception as error:  # a probe is never lost to sharing it
-            LOG.info("%s: not shared with DMM: %s", vid, safe_error(error))
-        return probe
-
-    def stored(self, vid, config, version=None):
-        """DMM's stored probe of the file this item plays, when it is a torrent's and DMM holds it:
-        matched by the torrent's hash, the exact size the link serves and, when the stream names
-        it, the file's name. None otherwise, and the item is probed."""
-        key = config.get("dmm_api_key")
-        if not key:
-            return None
-        try:
-            url = self._resolve(vid, config, version)
-        except Exception:
-            return None  # the probe tries the streams again and says why none opens
-        dmm = self.dmm_for(key)
-        with self.guard:
-            stream, headers = self.picked.get(vid), self.via.get(vid) or {}
-        hash_ = info_hash(stream)
-        if not hash_:
-            return None
-        hints = stream.get("behaviorHints") if isinstance(stream.get("behaviorHints"), dict) else {}
-        filename = hints.get("filename") if isinstance(hints.get("filename"), str) else None
-        probe = stored_probe(dmm.release(hash_), served_size(url, headers), filename)
-        if probe:
-            LOG.info("%s: DMM's stored probe of %s", vid, hash_)
-        return probe
-
     def probe(self, vid, catalog, config=None):
         config = self.config if config is None else config
-        url = rex_endpoint(config["relay_url"], "/%s/%s/%s.stream" % (catalog["directory"], catalog["slug"], vid))
+        url = rex_endpoint(config["relay_url"], "/%s/%s/%s.probe" % (catalog["directory"], catalog["slug"], vid))
+        started = time.monotonic()
+        flags = lenient_hls(config["ffprobe"])
         for attempt in range(2):
-            out = subprocess.run([config["ffprobe"], "-v", "error", *lenient_hls(config["ffprobe"]), "-print_format", "json",
-                                  "-show_format", "-show_streams", "-show_chapters", url], capture_output=True, timeout=300)
+            budget = PROBE_TIMEOUT if config.get("lazy_catalogs") else 300
+            out = subprocess.run([config["ffprobe"], "-v", "error", *flags, "-print_format", "json",
+                                  "-show_format", "-show_streams", "-show_chapters", url], capture_output=True,
+                                 timeout=max(.001, budget - (time.monotonic() - started)))
             if out.returncode == 0:
                 return json.loads(out.stdout)
             error = out.stderr.decode(errors="replace").strip()[-300:] or "ffprobe failed"
-            # A host's 5xx is its own hiccup, not a file ffprobe cannot read: asked once more, or the
-            # stream would be set aside for a day (archive.org answered 1 of 99 reads so, 2026-11-06).
-            # ponytail: only ffprobe's 5xx message is retried; add timeouts/resets once seen failing.
             if attempt or "Server returned 5XX" not in error:
                 raise RuntimeError(error)
-            LOG.info("%s: %s; asking again", vid, error)
+            if config.get("lazy_catalogs") and time.monotonic() - started + PROBE_RETRY_SECONDS >= PROBE_TIMEOUT:
+                raise RuntimeError(error)
             time.sleep(PROBE_RETRY_SECONDS)
 
-    def catalog_items(self, catalog, config=None, version=None, ready=None):
+    def measured_item(self, item, probe):
+        extension = CONTAINERS.get((probe.get("format") or {}).get("format_name"))
+        if not extension:
+            raise RuntimeError("probe found an unsupported container")
+        result = dict(item, media_info=probe)
+        result["path"] = item["path"].rsplit(".", 1)[0] + "." + extension
+        result["file"] = item["file"].rsplit(".", 1)[0] + "." + extension
+        size = (probe.get("format") or {}).get("size")
+        result.pop("size", None)
+        if size and extension != "m3u8":
+            result["size"] = int(size)
+        return result
+
+    def prepare(self, vid, *, prefetch=True):
+        """Measure on play; probe transport bypasses preparation to avoid recursion."""
+        with self.config_guard:
+            config, version = copy.deepcopy(self.config), self.config_version
+        with self.guard:
+            lock = self.locks.setdefault("prepare:" + vid, threading.Lock())
+        with lock:
+            for attempt in range(3):
+                url = self.resolve(vid)
+                with open(self.path("info", vid, config, version)) as handle:
+                    info = json.load(handle)
+                if self.prepared.get((version, vid)) == url:
+                    LOG.debug("PROBE item=%s already prepared; cached stream still opens", vid)
+                    break
+                try:
+                    LOG.info("PROBE start %s item=%s attempt=%d mode=%s", self.episode_label(vid), vid, attempt+1, "playback" if prefetch else "next-episode")
+                    probe = self.probe(vid, info["catalog"], config)
+                    LOG.info("PROBE complete item=%s container=%s tracks=%d", vid, (probe.get("format") or {}).get("format_name"), len(probe.get("streams") or []))
+                    if info["kind"] == "tv":
+                        probe = dict(probe, format=dict(probe.get("format") or {}))
+                        probe["format"].pop("duration", None)
+                    elif placeholder(probe):
+                        raise RuntimeError("placeholder clip")
+                    if not any(t.get("codec_type") == "video" for t in probe.get("streams") or []):
+                        raise RuntimeError("probe returned no picture")
+                    measured = self.measured_item(info["item"], probe)
+                except subprocess.TimeoutExpired:
+                    # A slow stream must fail this play rather than spending another ten
+                    # seconds on each fallback. subprocess.run kills and reaps ffprobe.
+                    self.refuse(vid, config, version)
+                    raise RuntimeError("stream probe timed out after %ss" % PROBE_TIMEOUT)
+                except Exception:
+                    if attempt == 2 or not self.refuse(vid, config, version):
+                        raise
+                    continue
+                with self.config_guard:
+                    if self.config_version != version:
+                        raise RuntimeError("settings changed during playback preparation")
+                self.cache_write(self.path(PROBES, vid, config, version), probe, version)
+                self.cache_update(self.path("info", vid, config, version), {"extension": measured["path"].rsplit(".", 1)[-1]}, version)
+                # Feed publication can wait behind a large Rex/Zurg update. Keep
+                # the episode request free so Rex's part read does not time out;
+                # publish the measured tracks in the background.
+                if prefetch:
+                    self.playback_publication_pool.submit(self.publish_playback, vid, measured, config, version)
+                else:
+                    self.publish_playback(vid, measured, config, version)
+                self.prepared[(version, vid)] = url
+                LOG.info("PLAYBACK prepared item=%s mode=%s", vid, "foreground" if prefetch else "prefetch")
+                break
+        return url
+
+    def publish_playback(self, vid, measured, config, version):
+        try:
+            with self.publication_lock:
+                if self.stale(version):
+                    return
+                answer = self.rex("POST", "/rex/feed/%s/items" % config["source"], {"items": [measured]}, config)
+                if answer.get("rejected"):
+                    raise RuntimeError("Rex rejected the measured item")
+                if self.snapshot_playbacks is not None:
+                    self.snapshot_playbacks[measured["id"]] = measured
+            LOG.info("PLAYBACK feed ready item=%s", vid)
+        except Exception as error:
+            LOG.warning("PLAYBACK feed failed item=%s error=%s", vid, safe_error(error))
+            raise
+
+    def episode_label(self, vid):
+        try:
+            with open(self.path("info", vid)) as handle:
+                info = json.load(handle)
+            sid = info.get("sid", "")
+            match = re.search(r":(\d+):(\d+)$", sid)
+            title = (info.get("item") or {}).get("name") or vid
+            return "%s S%02dE%02d" % (title, int(match[1]), int(match[2])) if match else title
+        except (OSError, ValueError, TypeError):
+            return vid
+
+    def started_stream(self, vid):
+        # Called only after a media body write, never HEAD, playlist or ffprobe.
+        now = time.monotonic()
+        with self.guard:
+            if now - self.playback_started.get(vid, -3600) < 300:
+                return
+            self.playback_started[vid] = now
+            if len(self.playback_started) > 2048:
+                self.playback_started = {key: at for key, at in self.playback_started.items() if now-at < 300}
+        LOG.info("PLAYBACK feeding Rex: %s item=%s first media bytes sent", self.episode_label(vid), vid)
+        if not re.search(r"-v[0-9a-f]{12}$", vid):
+            self.prepare_versions(vid)
+        try:
+            with open(self.path("info", vid)) as handle:
+                info = json.load(handle)
+            next_vid = info.get("next")
+            if next_vid:
+                LOG.info("NEXT_EPISODE playing=%s target=%s action=search-and-probe", self.episode_label(vid), self.episode_label(next_vid))
+                self.prefetch(next_vid)
+            else:
+                LOG.info("NEXT_EPISODE item=%s no next episode in catalog", vid)
+        except (OSError, ValueError) as error:
+            LOG.warning("NEXT_EPISODE item=%s cannot read episode chain: %s", vid, safe_error(error))
+
+    def prepare_versions(self, vid):
+        """Try five other ranked streams only after the first media bytes were sent."""
+        with self.guard:
+            if vid in self.versioning:
+                return
+            self.versioning.add(vid)
+            playback_search = self.playback_searches.pop(vid, None)
+
+        def work():
+            try:
+                with self.config_guard:
+                    config, version = copy.deepcopy(self.config), self.config_version
+                with open(self.path("info", vid, config, version)) as handle:
+                    base = json.load(handle)
+                if not base.get("item") or not base.get("stream"):
+                    return
+                search = playback_search if playback_search is not None else self.streams(base["kind"], base["sid"], config, base.get("also") or ())
+                if isinstance(search, StreamSearch):
+                    with search.condition:
+                        while search.pending and time.monotonic() < search.deadline:
+                            search.condition.wait(max(.001, search.deadline - time.monotonic()))
+                        streams = [stream for index in sorted(search.answers) for stream in search.answers[index]]
+                else:
+                    streams = search
+                chosen = base.get("stream")
+                seen = {chosen}
+                seen.update(entry.get("key") for entry in base.get("refused") or []
+                            if isinstance(entry, dict) and time.time() - entry.get("at", 0) < 86400)
+                candidates = []
+                for stream in ranked(streams, config):
+                    key = stream_key(stream)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append((key, stream))
+                    if len(candidates) == 5:
+                        break
+                if candidates:
+                    # Let the initial stream buffer before opening and probing alternatives.
+                    time.sleep(VERSION_PROBE_DELAY)
+                for key, stream in candidates:
+                    if self.stale(version):
+                        return
+                    suffix = hashlib.sha256(str(key).encode()).hexdigest()[:12]
+                    variant = vid + "-v" + suffix
+                    try:
+                        opened = opens(stream["url"], request_headers(stream))
+                        if not opened:
+                            continue
+                        item = dict(base["item"])
+                        item["id"] = base["item"]["id"] + "-v" + suffix
+                        item["release"] = base["item"]["release"] + ":v" + suffix
+                        item["path"] = base["item"]["path"].rsplit("/", 1)[0] + "/" + variant + ".mkv"
+                        item["file"] = config["mount"].rstrip("/") + "/" + item["path"]
+                        info = {k: base[k] for k in ("kind", "sid", "also", "catalog") if k in base}
+                        info.update(item=item, stream=key, variant_stream=key, extension="mkv")
+                        self.cache_write(self.path("info", variant, config, version), info, version)
+                        self.store_cache(version, variant, (opened, max(time.time(), min(expiry(stream["url"]), expiry(opened)) - 3600)), request_headers(stream))
+                        probe = self.probe(variant, base["catalog"], config)
+                        if base["kind"] == "tv":
+                            probe = dict(probe, format=dict(probe.get("format") or {}))
+                            probe["format"].pop("duration", None)
+                        elif placeholder(probe):
+                            raise RuntimeError("placeholder clip")
+                        if not any(track.get("codec_type") == "video" for track in probe.get("streams") or []):
+                            raise RuntimeError("probe returned no picture")
+                        measured = self.measured_item(item, probe)
+                        with self.publication_lock:
+                            if self.stale(version):
+                                return
+                            answer = self.rex("POST", "/rex/feed/%s/items" % config["source"], {"items": [measured]}, config)
+                            if answer.get("rejected"):
+                                raise RuntimeError("Rex rejected version")
+                            self.cache_write(self.path(PROBES, variant, config, version), probe, version)
+                            self.cache_update(self.path("info", variant, config, version), {"extension": measured["path"].rsplit(".", 1)[-1]}, version)
+                            with open(self.path("info", vid, config, version)) as handle:
+                                latest = json.load(handle)
+                            variants = list(latest.get("variants") or [])
+                            if variant not in variants:
+                                variants.append(variant)
+                                self.cache_update(self.path("info", vid, config, version), {"variants": variants}, version)
+                        LOG.info("VERSION ready item=%s candidate=%s", vid, suffix)
+                    except Exception as error:
+                        LOG.warning("VERSION failed item=%s candidate=%s error=%s", vid, suffix, safe_error(error))
+            except Exception as error:
+                LOG.warning("VERSION search failed item=%s error=%s", vid, safe_error(error))
+            finally:
+                with self.guard:
+                    self.versioning.discard(vid)
+
+        self.version_pool.submit(work)
+
+    def published_versions(self, items, config, version):
+        """Keep successfully measured versions in complete feed snapshots."""
+        extras = []
+        for item in items:
+            vid = item["path"].rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            try:
+                with open(self.path("info", vid, config, version)) as handle:
+                    variants = json.load(handle).get("variants") or []
+            except (OSError, ValueError, AttributeError):
+                continue
+            for variant in variants:
+                try:
+                    with open(self.path("info", variant, config, version)) as handle:
+                        version_item = json.load(handle)["item"]
+                    with open(self.path(PROBES, variant, config, version)) as handle:
+                        probe = json.load(handle)
+                    extras.append(self.measured_item(version_item, probe))
+                except (OSError, ValueError, KeyError, RuntimeError):
+                    continue
+        return extras
+
+    def prefetch(self, vid):
+        # Only the immediate next episode; preparation by a prefetch never
+        # schedules another, so opening episode one cannot resolve a season.
+        with self.guard:
+            if vid in self.prefetching:
+                LOG.debug("NEXT_EPISODE item=%s already preparing", vid)
+                return
+            self.prefetching.add(vid)
+        def work():
+            started = time.monotonic()
+            LOG.info("NEXT_EPISODE start %s item=%s searching/opening/probing", self.episode_label(vid), vid)
+            try:
+                self.prepare(vid, prefetch=False)
+                LOG.info("NEXT_EPISODE ready %s item=%s duration_s=%.3f measured feed accepted by Rex", self.episode_label(vid), vid, time.monotonic()-started)
+            except Exception as error:
+                LOG.warning("NEXT_EPISODE failed %s item=%s duration_s=%.3f error=%s", self.episode_label(vid), vid, time.monotonic()-started, safe_error(error))
+            finally:
+                with self.guard:
+                    self.prefetching.discard(vid)
+        self.prefetch_pool.submit(work)
+
+    def catalog_answer(self, catalog, config):
+        answer = get_json(catalog["url"])
+        if not config.get("lazy_catalogs") or not isinstance(answer, dict) or not isinstance(answer.get("metas"), list):
+            return answer
+        # Cinemeta is the fixed metadata source for these Popular catalogs. It need not be
+        # registered as a stream addon merely to page its public catalog.
+        supports_skip = catalog["url"].startswith(CINEMETA + "/catalog/")
+        for addon in config["addons"]:
+            if addon_base(addon["url"]) != catalog["url"].split("/catalog/", 1)[0]:
+                continue
+            for declaration in addon_manifest(addon).get("catalogs", []):
+                if declaration.get("type") == catalog["type"] and declaration.get("id") == catalog["url"].rsplit("/", 1)[-1][:-5]:
+                    supports_skip = "skip" in declaration.get("extraSupported", []) or any(isinstance(e, dict) and e.get("name") == "skip" for e in declaration.get("extra", []))
+        if not supports_skip:
+            return answer
+        rows = list(answer["metas"])
+        identity = lambda row: str(row.get("imdb_id") or row.get("id") or "") if isinstance(row, dict) else ""
+        seen = {identity(row) for row in rows} - {""}
+        offset = len(rows)
+        while rows and len(seen) < catalog["limit"]:
+            url = catalog["url"][:-5] + "/skip=%d.json" % offset
+            try:
+                page = get_json(url)
+                if not isinstance(page, dict) or not isinstance(page.get("metas"), list):
+                    raise ValueError("catalog page has no metas list")
+            except Exception as error:
+                return dict(answer, metas=rows, _incomplete=True)
+            fresh = [row for row in page["metas"] if identity(row) and identity(row) not in seen]
+            if not fresh:
+                break
+            rows.extend(fresh)
+            seen.update(identity(row) for row in fresh)
+            offset += len(page["metas"])
+        return dict(answer, metas=rows)
+
+    def catalog_items(self, catalog, config=None, version=None):
         """A catalog's films, or its series' episodes (Cinemeta's list of them), pushed by their
         IMDb ids so Plex names them; the catalog's own names and pictures are `display`, shown
         only until Plex names them. With `collections` on, a title an earlier catalog of the same
@@ -1308,7 +1619,8 @@ class Sync:
         self.catalog_listed = set()
         kind, limit = catalog["type"], catalog["limit"]
         complete = True
-        answer = get_json(catalog["url"])
+        answer = self.catalog_answer(catalog, config)
+        complete = not answer.get("_incomplete", False) if isinstance(answer, dict) else False
         if not isinstance(answer, dict) or not isinstance(answer.get("metas"), list):
             raise ValueError("catalog response has no metas list")
         if not answer["metas"]:
@@ -1316,11 +1628,12 @@ class Sync:
             # non-empty response proves that this catalog is really empty.
             complete = False
         wanted, skipped = [], 0
+        titles = set()
         for meta in answer["metas"]:
             if not isinstance(meta, dict):
                 complete = False
                 continue
-            if len(wanted) + skipped >= limit:
+            if (len(titles) if config.get("lazy_catalogs") else len(wanted) + skipped) >= limit:
                 continue
             if kind == "tv":
                 # A channel is known only by the addon's own id (`ustv-…`, `pp-live:…`), which is
@@ -1328,6 +1641,10 @@ class Sync:
                 if not isinstance(meta.get("id"), str) or not meta["id"]:
                     complete = False
                     continue
+                if config.get("lazy_catalogs"):
+                    if meta["id"] in titles:
+                        continue
+                    titles.add(meta["id"])
                 wanted.append(("%s-%s" % (catalog["slug"], re.sub(r"[^A-Za-z0-9_-]", "-", meta["id"])), meta["id"], meta, None, (), None))
                 continue
             own = meta["id"] if isinstance(meta.get("id"), str) else ""
@@ -1339,6 +1656,11 @@ class Sync:
             if not imdb and not own:
                 complete = False
                 continue
+            if config.get("lazy_catalogs"):
+                identity = imdb or own
+                if identity in titles:
+                    continue
+                titles.add(identity)
             # Ids carry the catalog: one film in two catalogs is two items, unless catalogs are
             # collections, when the first catalog of its library to list it holds it.
             if imdb and config.get("collections"):
@@ -1392,129 +1714,129 @@ class Sync:
                     continue
                 episodes.append(dict(raw_video, season=season, episode=episode))
             episodes.sort(key=lambda video: (video["season"], video["episode"]))
-            for video in episodes[:limit - len(wanted)]:
+            for video in (episodes if config.get("lazy_catalogs") else episodes[:limit - len(wanted)]):
                 vid = "%s-%s-%d-%d" % (catalog["slug"], label, video["season"], video["episode"])
                 if imdb:
                     also = ("%s:%d:%d" % (own, video["season"], video["episode"]),) if own and own != imdb else ()
                     wanted.append((vid, "%s:%d:%d" % (imdb, video["season"], video["episode"]), dict(full, **meta), video, also, imdb))
                 elif isinstance(video.get("id"), str) and video["id"]:
                     wanted.append((vid, video["id"], dict(full, **meta), video, (), None))
-        items = [None] * len(wanted)
-        batch, pushed_at = [], time.time()
-        # Items are probed probe_workers at a time, and each one reaches rex (`ready`) within
-        # READY_SECONDS of being ready, not when its whole catalog is done.
-        with ThreadPoolExecutor(config["probe_workers"]) as pool:
-            futures = {pool.submit(self._ready_item, entry, catalog, kind, config, version): at for at, entry in enumerate(wanted)}
-            for future in as_completed(futures):
-                item, ok = future.result()
-                complete &= ok
-                if item is None:
+        items = []
+        for at, (vid, sid, meta, video, also, imdb) in enumerate(wanted):
+            if self.stale(version):
+                # A settings save invalidated this catalog's relay paths and cache generation.
+                complete = False
+                break
+            if config.get("lazy_catalogs"):
+                probe = provisional_probe(meta, video)
+                if kind == "tv":
+                    probe["format"].pop("duration", None)
+                item = stremio_item(config, catalog, vid, sid if kind == "tv" else imdb, meta, video, probe, "mkv")
+                next_vid = wanted[at + 1][0] if video and at + 1 < len(wanted) and wanted[at + 1][0].rsplit("-", 2)[0] == vid.rsplit("-", 2)[0] else None
+                self.cache_update(self.path("info", vid, config, version), dict(kind=kind, sid=sid, also=list(also), catalog={k: catalog[k] for k in ("type", "slug", "directory", "library", "title") if k in catalog}, item=item, next=next_vid, extension="mkv"), version)
+                items.append(item)
+                continue
+            info_path = self.path("info", vid, config, version)
+            expected_info = dict({"kind": kind, "sid": sid}, **({"also": list(also)} if also else {}))
+            try:
+                info = self.cached("info", vid, lambda: expected_info, config, version)
+            except Exception as error:
+                complete = False
+                LOG.warning("%s: %s", vid, safe_error(error))
+                # A truncated JSON file is just as stale as a valid record for another item.
+                # Repair it before the probe so the next relay request sees a usable identity.
+                info = expected_info
+                self.cache_write(info_path, info, version)
+                self.cache_remove(self.path(PROBES, vid, config, version), version)
+            info_valid = isinstance(info, dict) and info.get("kind") == kind and info.get("sid") == sid
+            if info_valid and (info.get("also") or []) != list(also):
+                self.cache_update(info_path, {"also": list(also)}, version)
+            if not info_valid:
+                # Repair identity before probing. A stale identity means the derived probe belongs
+                # to a different source item and must not be reused for this one.
+                complete = False
+                info = expected_info
+                self.cache_write(info_path, info, version)
+                self.cache_remove(self.path(PROBES, vid, config, version), version)
+
+            # A corrupt or shape-invalid derived probe is repairable. Remove just that record
+            # and ask ffprobe once more; a real probe failure is still recorded as a partial
+            # catalog without repeatedly hammering the source.
+            probe_path = self.path(PROBES, vid, config, version)
+            extension = None
+            # A stream ffprobe cannot read or rex cannot take gives way to the next one: an
+            # addon's best-labelled link was a .zip of another show (Eclipsia, 2026-10-24), and
+            # pinned, it kept the title out of rex on every sync.
+            for _ in range(3):
+                probe = None
+                for attempt in range(2):
+                    had_cache = os.path.isfile(probe_path)
+                    try:
+                        probe = self.cached(PROBES, vid, lambda: self.probe(vid, catalog, config), config, version)
+                    except Exception as error:  # no stream that opens, or one ffprobe could not read
+                        complete = False
+                        if attempt == 0 and had_cache:
+                            self.cache_remove(probe_path, version)
+                            continue
+                        LOG.warning("%s: %s", vid, safe_error(error))
+                        break
+                    if isinstance(probe, dict) and isinstance(probe.get("format"), dict):
+                        break
+                    complete = False
+                    if attempt == 0:
+                        self.cache_remove(probe_path, version)
+                        continue
+                    LOG.warning("%s: ffprobe returned no format", vid)
+                    probe = None
+                if isinstance(probe, dict) and isinstance(probe.get("format"), dict):
+                    extension = CONTAINERS.get(probe["format"].get("format_name"))
+                    if extension and kind != "tv" and placeholder(probe):
+                        LOG.warning("%s: a %ss clip, not the title", vid, probe["format"].get("duration"))
+                        extension = None
+                    if extension and not any(isinstance(stream, dict) and stream.get("codec_type") == "video"
+                                             for stream in probe.get("streams") or []):
+                        # Pluto's MST3K probed as a subtitle track alone (2026-10-24).
+                        LOG.warning("%s: no picture in it", vid)
+                        extension = None
+                    if extension:
+                        break
+                    complete = False
+                    LOG.warning("%s: a %s stream rex cannot take", vid, probe["format"].get("format_name"))
+                if not self.refuse(vid, config, version):
+                    break
+            if not extension:
+                continue
+            if info.get("extension") != extension:
+                if not self.cache_update(info_path, {"extension": extension}, version):
+                    complete = False
                     continue
-                items[futures[future]] = item
-                batch.append(item)
-                if ready and (len(batch) >= READY_BATCH or time.time() - pushed_at >= READY_SECONDS):
-                    ready(batch)
-                    batch, pushed_at = [], time.time()
-                if self.dmm:
-                    self.dmm.flush()
-        if ready and batch:
-            ready(batch)
-        if self.dmm:
-            self.dmm.flush(final=True)
-        items = [item for item in items if item is not None]
+            try:
+                item = stremio_item(config, catalog, vid, sid if kind == "tv" else imdb, meta, video, probe, extension)
+                items.append(item)
+                self.cache_update(info_path, {"item": item, "catalog": {k: catalog[k] for k in ("type", "slug", "directory", "library", "title") if k in catalog},
+                                              "also": list(also)}, version)
+            except Exception as error:
+                complete = False
+                LOG.warning("%s: %s", vid, safe_error(error))
         LOG.info("%s: %d of %d ready", safe_url(catalog["url"]), len(items), len(wanted))
         self.catalog_incomplete = not complete
         return items
 
-    def _ready_item(self, entry, catalog, kind, config, version):
-        """One wanted item, probed (or DMM's stored probe), as the feed item rex is sent, and
-        whether it went as planned; (None, ok) when it does not go to rex."""
-        vid, sid, meta, video, also, imdb = entry
-        complete = True
-        if self.stale(version):
-            # A save replaced this pass's catalogs: the relay no longer routes their paths, so
-            # every probe left would 404 (5,147 of them on one VPS, 2026-10-26).
-            return None, False
-        info_path = self.path("info", vid, config, version)
-        expected_info = dict({"kind": kind, "sid": sid}, **({"also": list(also)} if also else {}))
-        try:
-            info = self.cached("info", vid, lambda: expected_info, config, version)
-        except Exception as error:
-            complete = False
-            LOG.warning("%s: %s", vid, safe_error(error))
-            # A truncated JSON file is just as stale as a valid record for another item.
-            # Repair it before the probe so the next relay request sees a usable identity.
-            info = expected_info
-            self.cache_write(info_path, info, version)
-            self.cache_remove(self.path(PROBES, vid, config, version), version)
-        info_valid = isinstance(info, dict) and info.get("kind") == kind and info.get("sid") == sid
-        if info_valid and (info.get("also") or []) != list(also):
-            self.cache_update(info_path, {"also": list(also)}, version)
-        if not info_valid:
-            # Repair identity before probing. A stale identity means the derived probe belongs
-            # to a different source item and must not be reused for this one.
-            complete = False
-            info = expected_info
-            self.cache_write(info_path, info, version)
-            self.cache_remove(self.path(PROBES, vid, config, version), version)
-
-        # A corrupt or shape-invalid derived probe is repairable. Remove just that record
-        # and ask ffprobe once more; a real probe failure is still recorded as a partial
-        # catalog without repeatedly hammering the source.
-        probe_path = self.path(PROBES, vid, config, version)
-        extension = None
-        # A stream ffprobe cannot read or rex cannot take gives way to the next one: an
-        # addon's best-labelled link was a .zip of another show (Eclipsia, 2026-10-24), and
-        # pinned, it kept the title out of rex on every sync.
-        for _ in range(3):
-            probe = None
-            for attempt in range(2):
-                had_cache = os.path.isfile(probe_path)
-                try:
-                    probe = self.cached(PROBES, vid, lambda: self.stored(vid, config, version) or self.share(vid, self.probe(vid, catalog, config), config),
-                                        config, version)
-                except Exception as error:  # no stream that opens, or one ffprobe could not read
-                    complete = False
-                    if attempt == 0 and had_cache:
-                        self.cache_remove(probe_path, version)
-                        continue
-                    LOG.warning("%s: %s", vid, safe_error(error))
-                    break
-                if isinstance(probe, dict) and isinstance(probe.get("format"), dict):
-                    break
-                complete = False
-                if attempt == 0:
-                    self.cache_remove(probe_path, version)
-                    continue
-                LOG.warning("%s: ffprobe returned no format", vid)
-                probe = None
-            if isinstance(probe, dict) and isinstance(probe.get("format"), dict):
-                extension = CONTAINERS.get(probe["format"].get("format_name"))
-                if extension and kind != "tv" and placeholder(probe):
-                    LOG.warning("%s: a %ss clip, not the title", vid, probe["format"].get("duration"))
-                    extension = None
-                if extension and not any(isinstance(stream, dict) and stream.get("codec_type") == "video"
-                                         for stream in probe.get("streams") or []):
-                    # Pluto's MST3K probed as a subtitle track alone (2026-10-24).
-                    LOG.warning("%s: no picture in it", vid)
-                    extension = None
-                if extension:
-                    break
-                complete = False
-                LOG.warning("%s: a %s stream rex cannot take", vid, probe["format"].get("format_name"))
-            if not self.refuse(vid, config, version):
-                break
-        if not extension:
-            return None, complete
-        if info.get("extension") != extension:
-            if not self.cache_update(info_path, {"extension": extension}, version):
-                complete = False
-                return None, complete
-        try:
-            return stremio_item(config, catalog, vid, sid if kind == "tv" else imdb, meta, video, probe, extension), complete
-        except Exception as error:
-            LOG.warning("%s: %s", vid, safe_error(error))
-            return None, False
+    def lazy_chunk(self, chunk, config, version):
+        if not config.get("lazy_catalogs"):
+            return chunk
+        result = []
+        for item in chunk:
+            vid = item["path"].rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            self.cache_update(self.path("info", vid, config, version), {"item": item}, version)
+            try:
+                with open(self.path(PROBES, vid, config, version)) as handle:
+                    item = self.measured_item(item, json.load(handle))
+                self.cache_update(self.path("info", vid, config, version), {"extension": item["path"].rsplit(".", 1)[-1]}, version)
+            except (OSError, ValueError, RuntimeError):
+                pass
+            result.append(item)
+        return result
 
     def once(self):
         with self.config_guard:
@@ -1531,27 +1853,14 @@ class Sync:
                     return
             self.register(config)
         items = []
+        batch_size = max(1, min(1000, int(config.get("feed_batch_size", 200))))
         incomplete = False
         self.taken, listed = set(), []
-        sent = set()
-
-        def upsert(batch):
-            """Each item shows in rex once it is ready, not hours later when the last catalog is;
-            the snapshot at the end still removes what is gone. False once settings changed."""
-            for at in range(0, len(batch), 200):
-                answer = self.publish(version, "POST", "/rex/feed/%s/items" % config["source"], {"items": batch[at:at + 200]}, config)
-                if answer is None:
-                    return False
-                sent.update(id(item) for item in batch[at:at + 200])
-                for rejected in answer.get("rejected") or []:
-                    if isinstance(rejected, dict):
-                        LOG.warning("rex rejected %s: %s", rejected.get("id"), safe_error(rejected.get("reason")))
-            return True
-
         for catalog in config["catalogs"]:
+            before = len(items)
             try:
-                found = self.catalog_items(catalog, config, version, ready=upsert)
-                items += found
+                items += self.catalog_items(catalog, config, version)
+                items += self.published_versions(items[before:], config, version)
                 listed.append((catalog, self.catalog_listed))
                 incomplete |= self.catalog_incomplete
             except Exception as error:
@@ -1559,9 +1868,20 @@ class Sync:
                 self.status = "failed at %s: %s" % (safe_error(catalog.get("title") or catalog["slug"]), safe_error(error))
                 LOG.warning("%s: %s", safe_url(catalog["url"]), safe_error(error))
                 continue
-            if self.stale(version) or not upsert([item for item in found if id(item) not in sent]):
+            if self.stale(version):
                 self.status = "settings changed during sync; retrying"
                 return
+            # Each catalog shows in rex once it is checked, not hours later when the last one is;
+            # the snapshot at the end still removes what is gone.
+            for at in range(0, len(items) - before, batch_size):
+                answer = self.publish(version, "POST", "/rex/feed/%s/items" % config["source"],
+                                      {"items": items[before + at:before + at + batch_size]}, config)
+                if answer is None:
+                    self.status = "settings changed during sync; retrying"
+                    return
+                for rejected in answer.get("rejected") or []:
+                    if isinstance(rejected, dict):
+                        LOG.warning("rex rejected %s: %s", rejected.get("id"), safe_error(rejected.get("reason")))
         if config.get("collections"):
             # Every file of a title names all its collections: rex keeps the last list it was sent.
             for item in items:
@@ -1573,34 +1893,83 @@ class Sync:
                                            if catalog["directory"] == directory and catalog["type"] == kind and imdb in ids]
         if incomplete:
             # Every item went up with its catalog; only the collections, known now, are left to send.
-            chunks = [items[at:at + 200] for at in range(0, len(items), 200)] if config.get("collections") else []
+            chunks = [items[at:at + batch_size] for at in range(0, len(items), batch_size)] if config.get("collections") else []
             for chunk in chunks:
                 answer = self.publish(version, "POST", "/rex/feed/%s/items" % config["source"], {"items": chunk}, config)
                 if answer is None:
                     self.status = "settings changed during sync; retrying"
                     return
             self.status = "%s: partial sync, %d items upserted" % (time.strftime("%Y-%m-%d %H:%M"), len(items))
+            self.update_collection_posters(config)
             LOG.warning("upserted %d items without removing existing rows", len(items))
             return
-        session = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        chunks = [items[at:at + 200] for at in range(0, len(items), 200)] or [[]]
-        for part, chunk in enumerate(chunks):
-            body = {"session": session, "part": part, "complete": part == len(chunks) - 1, "items": chunk}
-            if body["complete"] and self.force_next:
-                body["force"] = True
-            answer = self.publish(version, "PUT", "/rex/feed/%s/snapshot" % config["source"], body, config)
-            if answer is None:
-                self.status = "settings changed during sync; retrying"
-                return
-            for rejected in answer.get("rejected") or []:
-                if not isinstance(rejected, dict):
-                    continue
-                LOG.warning("rex rejected %s: %s", rejected.get("id"), safe_error(rejected.get("reason")))
+        with self.publication_lock:
+            session = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            present = {item["id"] for item in items}
+            items.extend(item for item in self.published_versions(items, config, version) if item["id"] not in present)
+            chunks = [items[at:at + batch_size] for at in range(0, len(items), batch_size)] or [[]]
+            self.snapshot_playbacks = {}
+        try:
+            for part, chunk in enumerate(chunks):
+                body = {"session": session, "part": part, "complete": part == len(chunks) - 1, "items": chunk}
+                if body["complete"] and self.force_next:
+                    body["force"] = True
+                answer = self.publish(version, "PUT", "/rex/feed/%s/snapshot" % config["source"], body, config)
+                if answer is None:
+                    self.status = "settings changed during sync; retrying"
+                    return
+                for rejected in answer.get("rejected") or []:
+                    if not isinstance(rejected, dict):
+                        continue
+                    LOG.warning("rex rejected %s: %s", rejected.get("id"), safe_error(rejected.get("reason")))
+        finally:
+            # Let a play publish between snapshot chunks. Replay those measured
+            # rows after the final chunk, which may have contained older probes.
+            with self.publication_lock:
+                measured = list((self.snapshot_playbacks or {}).values())
+                self.snapshot_playbacks = None
+                if measured and not self.stale(version):
+                    answer = self.rex("POST", "/rex/feed/%s/items" % config["source"],
+                                      {"items": measured}, config)
+                    if answer.get("rejected"):
+                        LOG.warning("rex rejected %d playback refresh(es)", len(answer["rejected"]))
         with self.config_guard:
             if self.config_version == version:
                 self.force_next = False
         self.status = "%s: %d items in rex" % (time.strftime("%Y-%m-%d %H:%M"), len(items))
+        self.update_collection_posters(config)
         LOG.info("pushed %d items: %s", len(items), {key: answer.get(key) for key in ("created", "updated", "removed")})
+
+    def schedule_collection_posters(self, config):
+        """Coalesce feed batches into a background cover pass, including a trailing pass."""
+        if not (config.get("collections") and config.get("collection_posters")):
+            return
+        with self.poster_schedule_lock:
+            self.poster_pending = config
+            if self.poster_running:
+                return
+            self.poster_running = True
+        threading.Thread(target=self.collection_poster_worker,
+                         name="collection-posters", daemon=True).start()
+
+    def collection_poster_worker(self):
+        while True:
+            with self.poster_schedule_lock:
+                config = self.poster_pending
+                self.poster_pending = None
+                if config is None:
+                    self.poster_running = False
+                    return
+            self.update_collection_posters(config)
+
+    def update_collection_posters(self, config):
+        if config.get("collections") and config.get("collection_posters"):
+            try:
+                from collection_posters import sync_posters
+                with self.poster_lock:
+                    sync_posters(config)
+            except Exception as error:
+                LOG.warning("collection posters: %s", safe_error(error))
 
     def forever(self):
         soon = 0
@@ -1612,7 +1981,6 @@ class Sync:
             except Exception as error:
                 self.status = "failed: %s" % safe_error(error)
                 LOG.warning("sync: %s", safe_error(error))
-            # Titles an addon refused are asked again after retry_minutes, three passes running.
             soon = soon + 1 if self.retry_soon and soon < 3 else 0
             with self.config_guard:
                 interval = self.config["retry_minutes"] if soon else self.config["interval_minutes"]
@@ -1707,7 +2075,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 body{font:15px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg);max-width:860px;margin:0 auto;padding:16px}
 h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 8px}p.muted,small{color:var(--muted)}
 table{width:100%%;border-collapse:collapse}td,th{padding:6px 4px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
-input[type=text],input[type=url],input[type=number],input[type=password],select{font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px;background:transparent;color:inherit;max-width:100%%}
+input[type=text],input[type=url],input[type=number],select{font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:6px;background:transparent;color:inherit;max-width:100%%}
 button{font:inherit;padding:5px 12px;border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:var(--on-accent);cursor:pointer}
 button.plain{background:transparent;color:var(--accent)}form.inline{display:inline}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .scroll{overflow-x:auto}input[type=checkbox]{accent-color:var(--accent)}
@@ -1721,8 +2089,8 @@ button.plain{background:transparent;color:var(--accent)}form.inline{display:inli
 <button>Add</button></form>
 <form method="post" action="/settings">
 <h2>Catalogs</h2>
-<p class="muted">Each chosen catalog's films, or episodes, go into the library you name. Same name, same library.</p>
-<div class="scroll"><table><tr><th>Take</th><th>Catalog</th><th>Library</th><th>How many</th></tr>%(catalogs)s</table></div>
+<p class="muted">Each chosen catalog goes into the library you name. With collections enabled, Collection name labels its collection and generated poster. Limits count movies, shows or live channels.</p>
+<div class="scroll"><table><tr><th>Take</th><th>Catalog</th><th>Collection name</th><th>Library</th><th>Titles / shows</th></tr>%(catalogs)s</table></div>
 <div class="row" style="margin-top:8px"><input type="checkbox" id="collections" name="collections" value="1"%(collections)s>
 <label for="collections">Catalogs as collections: each catalog is a collection in its library, and a title in several is there once</label></div>
 <h2>Streams</h2>
@@ -1731,10 +2099,11 @@ button.plain{background:transparent;color:var(--accent)}form.inline{display:inli
 <label for="size">Largest file (GB)</label><input id="size" type="number" min="0" step="0.1" name="max_size_gb" value="%(max_size_gb)s" placeholder="any"></div>
 <h2>rex</h2>
 <div class="row"><label for="rex">rex's address</label><input id="rex" type="url" name="rex_url" value="%(rex_url)s" required style="flex:1;min-width:220px"></div>
-<h2>DMM</h2>
-<p class="muted">With a DMM sponsor's API key, a title DMM has seen before skips its ffprobe: it shows in rex in seconds. Others are probed as before, and what ffprobe read of a torrent's file (its hash, size, name and streams) goes back to DMM for the next sponsor.</p>
-<div class="row"><label for="dmm">DMM API key</label><input id="dmm" type="password" name="dmm_api_key" autocomplete="off" placeholder="%(dmm_placeholder)s" style="flex:1;min-width:220px">
-<input type="checkbox" id="dmm-forget" name="dmm_forget" value="1"><label for="dmm-forget">Forget the key</label></div>
+<h2>On-demand libraries</h2>
+<p class="muted">Virtual movie and show cards use these separate libraries. Hidden libraries stay out of Home and global search.</p>
+<div class="row"><label for="ondemand_movies_library">Movies library</label><input id="ondemand_movies_library" type="text" name="ondemand_movies_library" value="%(ondemand_movies_library)s" required maxlength="160">
+<label for="ondemand_tv_library">TV library</label><input id="ondemand_tv_library" type="text" name="ondemand_tv_library" value="%(ondemand_tv_library)s" required maxlength="160"></div>
+<div class="row"><input type="checkbox" id="hide_ondemand_libraries" name="hide_ondemand_libraries" value="1"%(hide_ondemand_libraries)s><label for="hide_ondemand_libraries">Hide on-demand libraries from Home and global search</label></div>
 <p style="margin-top:20px"><button>Save and sync</button></p>
 </form></body></html>"""
 
@@ -1771,25 +2140,29 @@ def page(config, status):
             addon_name = manifest.get("name") or "addon"
             name = "%s: %s (%s)" % (addon_name, catalog["name"],
                                     {"movie": "films", "series": "episodes", "tv": "channels"}[catalog["type"]])
-            catalogs.append('<tr><td><input type="checkbox" id="c%d" name="take" value="%d"%s><input type="hidden" name="url%d" value="%s">'
-                            '<input type="hidden" name="title%d" value="%s"><input type="hidden" name="slug%d" value="%s">'
-                            '<input type="hidden" name="directory%d" value="%s"></td><td><label for="c%d">%s</label></td>'
-                            '<td><input type="text" name="library%d" value="%s" aria-label="Library"></td>'
-                            '<td><input type="number" min="1" name="limit%d" value="%s" aria-label="How many" style="width:5em"></td></tr>'
-                            % (n, n, " checked" if chosen else "", n, esc(url), n, esc(addon_name + " " + catalog["name"]),
-                               n, esc(chosen.get("slug") or ""), n, esc(chosen.get("directory") or ""), n, esc(name),
-                               n, esc(library), n, esc(chosen.get("limit") or 50)))
+            collection_name = chosen.get("title") or catalog["name"]
+            catalogs.append(
+                f'<tr><td><input type="checkbox" id="c{n}" name="take" value="{n}"'
+                + (' checked' if chosen else '') + '>'
+                + f'<input type="hidden" name="url{n}" value="{esc(url)}">'
+                + f'<input type="hidden" name="slug{n}" value="{esc(chosen.get("slug") or "")}">'
+                + f'<input type="hidden" name="directory{n}" value="{esc(chosen.get("directory") or "")}"></td>'
+                + f'<td><label for="c{n}">{esc(name)}</label></td>'
+                + f'<td><input type="text" name="title{n}" value="{esc(collection_name)}" aria-label="Collection name" required maxlength="160"></td>'
+                + f'<td><input type="text" name="library{n}" value="{esc(library)}" aria-label="Library"></td>'
+                + f'<td><input type="number" min="1" name="limit{n}" value="{esc(chosen.get("limit") or 50)}" aria-label="How many" style="width:5em"></td></tr>')
             n += 1
     resolutions = "".join('<option value="%s"%s>%s</option>' % (value, " selected" if str(config.get("max_resolution") or "") == value else "", label)
                           for value, label in (("", "any"), ("2160", "2160p (4K)"), ("1080", "1080p"), ("720", "720p")))
     return PAGE % {"status": esc(safe_error(status)), "addons": "".join(rows) or '<tr><td colspan="3"><small>None yet.</small></td></tr>',
-                   "catalogs": "".join(catalogs) or '<tr><td colspan="4"><small>Add an addon with catalogs, such as Cinemeta.</small></td></tr>',
+                   "catalogs": "".join(catalogs) or '<tr><td colspan="5"><small>Add an addon with catalogs, such as Cinemeta.</small></td></tr>',
                    "resolutions": resolutions, "collections": " checked" if config.get("collections") else "", "max_size_gb": esc("%g" % config["max_size_gb"] if config.get("max_size_gb") else ""),
+                   "ondemand_movies_library": esc(config["ondemand_movies_library"]),
+                   "ondemand_tv_library": esc(config["ondemand_tv_library"]),
+                   "hide_ondemand_libraries": " checked" if config.get("hide_ondemand_libraries") else "",
                    # The settings field is an authorized private input and must round-trip exactly;
                    # safe_url is reserved for logs/status and addon display.
-                   "rex_url": esc(config["rex_url"]),
-                   # The key itself is never put back into the page, only whether one is saved.
-                   "dmm_placeholder": "saved; type a new one to replace it" if config.get("dmm_api_key") else "none"}
+                   "rex_url": esc(config["rex_url"])}
 
 
 class App:
@@ -1807,7 +2180,7 @@ class App:
             for at in form.get("take", []):
                 url = form.get("url" + at, [""])[0]
                 limit = form.get("limit" + at, ["50"])[0]
-                catalog = {"url": url, "title": form.get("title" + at, [""])[0] or None,
+                catalog = {"url": url, "title": form.get("title" + at, [""])[0].strip()[:160] or None,
                            "library": form.get("library" + at, [""])[0].strip() or None,
                            "limit": int(limit) if limit.isdigit() and int(limit) > 0 else 50}
                 for key in ("slug", "directory"):
@@ -1824,6 +2197,9 @@ class App:
                 catalogs.append(catalog)
             values["catalogs"] = [{key: value for key, value in catalog.items() if value} for catalog in catalogs]
             values["collections"] = form.get("collections", [""])[0] == "1"
+            values["ondemand_movies_library"] = form.get("ondemand_movies_library", [DEFAULTS["ondemand_movies_library"]])[0].strip()[:160]
+            values["ondemand_tv_library"] = form.get("ondemand_tv_library", [DEFAULTS["ondemand_tv_library"]])[0].strip()[:160]
+            values["hide_ondemand_libraries"] = form.get("hide_ondemand_libraries", [""])[0] == "1"
             values["max_resolution"] = int(form["max_resolution"][0]) if form.get("max_resolution", [""])[0].isdigit() else None
             size = form.get("max_size_gb", [""])[0]
             values["max_size_gb"] = float(size) if re.fullmatch(r"\d+(\.\d+)?", size) and float(size) > 0 else None
@@ -1831,9 +2207,6 @@ class App:
             if not rex_url.startswith(("http://", "https://")):
                 raise ValueError("rex_url must be an http(s) URL")
             values["rex_url"] = rex_url
-            key = form.get("dmm_api_key", [""])[0].strip()
-            # An empty field keeps the saved key: the page never shows it, so it cannot round-trip.
-            values["dmm_api_key"] = None if form.get("dmm_forget", [""])[0] == "1" else key or self.config.get("dmm_api_key")
             self.save(values)
 
     def add_addon(self, url):
@@ -1885,6 +2258,17 @@ class App:
 
             def do_GET(self):
                 path = urllib.parse.urlsplit(self.path).path
+                self.probe_request = path.endswith(".probe") or urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("probe") == ["1"]
+                warm = re.fullmatch(r"/_rex/detail/([A-Za-z0-9_-]+)", path)
+                if warm:
+                    if not own_network(self):
+                        self.send_error(403)
+                        return
+                    app.sync.warm_search(warm[1])
+                    self.send_response(200)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if path == "/":
                     if not own_network(self):
                         self.send_error(403)
@@ -1907,19 +2291,43 @@ class App:
                         return
                     self.relay(relayed[1], url, headers)
                     return
+                if path.startswith("/collection-posters/"):
+                    from collection_posters import poster_key, render
+                    with app.sync.config_guard:
+                        names = [c.get("title") or c["slug"] for c in app.sync.config["catalogs"] if c["type"] != "tv"]
+                    name = next((n for n in names if path == "/collection-posters/" + poster_key(n) + ".png"), None)
+                    if name is None:
+                        self.send_error(404)
+                        return
+                    body = render(name)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "public, max-age=86400")
+                    self.end_headers()
+                    if self.command != "HEAD": self.wfile.write(body)
+                    return
                 vid = app.sync.route_vid(path)
                 if not vid:
                     self.send_error(404)
                     return
+                # Rex's file-availability checks use HEAD. A catalog entry is a
+                # virtual file: its existence does not require a playable link yet.
+                if self.command == "HEAD" and not path.endswith(".probe"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    return
                 try:
-                    url = app.sync.resolve(vid)
+                    url = app.sync.prepare(vid) if app.sync.config.get("lazy_catalogs") and not path.endswith(".probe") else app.sync.resolve(vid)
                 except Exception as error:
                     LOG.warning("resolve %s: %s", vid, safe_error(error))
                     self.send_error(502, "No stream addon has a stream that opens")
                     return
                 with app.sync.guard:
                     headers = app.sync.via.get(vid) or {}
-                if headers:
+                if headers or app.sync.config.get("lazy_catalogs"):
                     self.relay(vid, url, headers)
                     return
                 master = self.trimmed(url, self.headers.get("User-Agent")) if urllib.parse.urlsplit(url).path.endswith(".m3u8") else None
@@ -1971,7 +2379,7 @@ class App:
                         text = upstream.read(MAX_JSON_BYTES).decode("utf-8", "replace")
                         if text.lstrip().startswith("#EXTM3U"):
                             text = one_variant(text, upstream.geturl(), app.config.get("max_resolution")) or text
-                            body = rewrite_playlist(text, upstream.geturl(), lambda link: app.sync.remember(vid, link)).encode()
+                            body = rewrite_playlist(text, upstream.geturl(), lambda link: app.sync.remember(vid, link) + ("?probe=1" if self.probe_request else "")).encode()
                             self.send_response(200)
                             self.send_header("Content-Type", "application/vnd.apple.mpegurl")
                             self.send_header("Content-Length", str(len(body)))
@@ -1999,6 +2407,8 @@ class App:
                             if not chunk:
                                 break
                             self.wfile.write(chunk)
+                            if not self.probe_request:
+                                app.sync.started_stream(vid)
                     except (BrokenPipeError, ConnectionResetError):
                         pass
 
@@ -2024,6 +2434,7 @@ class App:
                     self.send_error(400, "invalid request")
                     return
                 path = urllib.parse.urlsplit(self.path).path
+                self.probe_request = path.endswith(".probe") or urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("probe") == ["1"]
                 try:
                     if path == "/addons":
                         app.add_addon(form.get("url", [""])[0])
@@ -2052,12 +2463,14 @@ class App:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default="config.json")
+    parser.add_argument("--debug", action="store_true", help="detailed search/probe/playback logs (no stream URLs)")
     parser.add_argument("--once", action="store_true", help="sync once while the relay runs, then exit")
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if not os.path.exists(args.config):
         save_config(args.config, {"listen": os.environ.get("REX_STREMIO_LISTEN") or DEFAULTS["listen"]})
     config = load_config(args.config)
+    LOG.info("debug logging=%s; next episode searches begin after first media bytes to Rex", args.debug)
     sync = Sync(config)
     host, port = config["listen"].rsplit(":", 1)
     server = ThreadingHTTPServer((host, int(port)), App(args.config, config, sync).handler())

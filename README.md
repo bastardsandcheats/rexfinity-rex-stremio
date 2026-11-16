@@ -100,6 +100,7 @@ The page writes `config.json` (mode 600). You can also edit it yourself and rest
 | Key | Default | What it is |
 |---|---|---|
 | `rex_url` | `http://127.0.0.1:32400` | rex's address |
+| `rex_token` | none | Optional `X-Plex-Token` for Rex library settings; stored in `config.json` mode 600 |
 | `listen` | `127.0.0.1:9982` | Where the settings page and the relay answer. A change needs a restart |
 | `relay_url` | `http://<listen>` | The address rex reads the videos from, when rex runs on another machine or in Docker |
 | `source` | `stremio` | The name rex knows this source by |
@@ -114,6 +115,9 @@ The page writes `config.json` (mode 600). You can also edit it yourself and rest
 | `max_resolution` | any | `2160`, `1080` or `720`: no stream above it plays |
 | `max_size_gb` | any | No stream larger than this plays |
 | `collections` | `false` | Each catalog a collection in its library, and a title several catalogs of one library list there once. Needs a rex whose feed takes `collections` |
+| `ondemand_movies_library` | `On Demand Movies` | Library title used for Rex's virtual on-demand movie cards |
+| `ondemand_tv_library` | `On Demand TV` | Library title used for Rex's virtual on-demand show cards |
+| `hide_ondemand_libraries` | `true` | Keep those virtual-card libraries out of Home and global search |
 | `addons` | | Each addon's manifest `url`, and its `manifest` as it was when added |
 | `catalogs` | | Each catalog's `url` (`<addon>/catalog/<movie, series or tv>/<id>.json`), `library`, `limit` (default 50), `title`, and its persisted `slug`/`directory` identity |
 

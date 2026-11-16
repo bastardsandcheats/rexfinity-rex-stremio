@@ -1,0 +1,15 @@
+[Unit]
+Description=Rexfinity isolated Popular Stremio source
+After=network-online.target rexfinity-rex.service
+Wants=network-online.target
+Requires=rexfinity-rex.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rexfinity/rex-stremio
+ExecStart=/opt/rexfinity/rex-stremio/run-rexfinity.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
