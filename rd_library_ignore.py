@@ -8,7 +8,9 @@ import sys
 import threading
 import time
 from pathlib import Path
-import requests
+import json
+import urllib.parse
+import urllib.request
 
 LOG = logging.getLogger('rex-stremio')
 HASH = re.compile(r'[0-9a-f]{40}', re.I)
@@ -148,12 +150,14 @@ class LibraryIgnore:
                     LOG.warning('RD library ignore check failed: %s', type(error).__name__)
                 if settings.torbox_api_key:
                     try:
-                        response = requests.get('https://api.torbox.app/v1/api/torrents/mylist',
-                                                headers={'Authorization': 'Bearer ' + settings.torbox_api_key},
-                                                params={'bypass_cache': 'true', 'limit': 100, 'offset': 0},
-                                                timeout=15)
-                        response.raise_for_status()
-                        rows = response.json().get('data') or []
+                        query = urllib.parse.urlencode({'bypass_cache': 'true', 'limit': 100, 'offset': 0})
+                        request = urllib.request.Request(
+                            'https://api.torbox.app/v1/api/torrents/mylist?' + query,
+                            headers={'Authorization': 'Bearer ' + settings.torbox_api_key,
+                                     'Accept': 'application/json', 'User-Agent': 'rex-stremio'})
+                        with urllib.request.urlopen(request, timeout=15) as response:
+                            answer = json.loads(response.read())
+                        rows = answer.get('data') or []
                         if not isinstance(rows, list):
                             raise ValueError('TorBox inventory was not a list')
                         matches = torbox_matches(rows, pending, seen)
